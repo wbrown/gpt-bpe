@@ -21,7 +21,7 @@ import (
 	"github.com/wbrown/gpt_bpe/types"
 )
 
-const BPE_LRU_SZ = 65536
+const BPE_LRU_SZ = 16384
 const RUNEBUF_SZ = 16384
 const WORDCHAN_SZ = 4096
 const defaultPadTokenString = "[PAD]"
@@ -44,6 +44,7 @@ type GPTEncoder struct {
 	Specials        map[string]Tokens
 	SpecialsTree    *RuneNode
 	Cache           *lru.ARCCache
+	TwoTierCache    *TypedTwoTierCache
 	PuncRunes       []rune
 	Normalizer      *strings.Replacer
 	DecodeExtra     *strings.Replacer
@@ -151,6 +152,52 @@ func NewLlama3Encoder() GPTEncoder {
 func NewMistralEncoder() GPTEncoder {
 	encoder, _ := NewEncoder(VOCAB_ID_MISTRAL)
 	return *encoder
+}
+
+func (encoder *GPTEncoder) Clone() *GPTEncoder {
+	// Shallow copy everything first
+	clone := *encoder
+	clone.Cache, _ = lru.NewARC(BPE_LRU_SZ)
+	// Copy our maps
+	clone.Encoder = make(map[string]Token)
+	for k, v := range encoder.Encoder {
+		clone.Encoder[k] = v
+	}
+	clone.Decoder = make(map[Token][]byte)
+	for k, v := range encoder.Decoder {
+		clone.Decoder[k] = v
+	}
+	clone.BpeRanks = make(map[GPTPair]float64)
+	for k, v := range encoder.BpeRanks {
+		clone.BpeRanks[k] = v
+	}
+	clone.TokenMerges = make(map[TokenPair]Token)
+	for k, v := range encoder.TokenMerges {
+		clone.TokenMerges[k] = v
+	}
+	if encoder.BytesEncoder != nil {
+		encoderCopy := make(map[byte]Token)
+		for k, v := range *encoder.BytesEncoder {
+			encoderCopy[k] = v
+		}
+		clone.BytesEncoder = &encoderCopy
+	}
+	clone.unitrim = make([]int, len(encoder.unitrim))
+	copy(clone.unitrim, encoder.unitrim)
+	clone.PuncRunes = make([]rune, len(encoder.PuncRunes))
+	copy(clone.PuncRunes, encoder.PuncRunes)
+	clone.Normalizer = encoder.Normalizer
+	clone.DecodeExtra = encoder.DecodeExtra
+	clone.Specials = make(map[string]Tokens)
+	for k, v := range encoder.Specials {
+		clone.Specials[k] = v
+	}
+	clone.UpdateSpecialsTree()
+	for k, v := range encoder.replacements {
+		clone.replacements[k] = v
+	}
+	clone.runeBufSz = encoder.runeBufSz
+	return &clone
 }
 
 // NewEncoder
@@ -442,7 +489,7 @@ func NewEncoder(vocabId string) (*GPTEncoder, error) {
 		LruMisses:       0,
 		LruEvictions:    0,
 		LruSize:         BPE_LRU_SZ,
-		SplitterThreads: 4,
+		SplitterThreads: 2,
 		VocabId:         vocabId,
 		tokenizerClass:  *hfConfig.TokenizerClass,
 	}
@@ -594,39 +641,112 @@ func makeUnitrimArr(encoderMap map[string]Token) []int {
 	return debtLUT
 }
 
-// insertAt inserts v into s at index i and returns the new slice.
-func insertAt(data []BGERank, i int, v BGERank) []BGERank {
-	if i == len(data) {
-		// Insert at end is the easy case.
+type PreallocBGERanks struct {
+	data []BGERank
+	len  int
+}
+
+func NewPreallocBGERanks(capacity int) *PreallocBGERanks {
+	return &PreallocBGERanks{
+		data: make([]BGERank, capacity),
+		len:  0,
+	}
+}
+
+func (p *PreallocBGERanks) InsertSorted(v BGERank) {
+	// Binary search
+	i := sort.Search(
+		p.len, func(i int) bool {
+			return p.data[i].rank >= v.rank
+		},
+	)
+
+	// Check for exact duplicate using full BGERank comparison
+	if i < p.len && p.data[i].rank == v.rank && p.data[i].bigram == v.bigram {
+		return
+	}
+
+	// Ensure we have space
+	if p.len >= len(p.data) {
+		return // or could panic/grow if needed
+	}
+
+	// Shift and insert
+	if i < p.len {
+		copy(p.data[i+1:p.len+1], p.data[i:p.len])
+	}
+	p.data[i] = v
+	p.len++
+}
+
+func findBestPair(word []string, bpeRanks map[GPTPair]float64) (
+	BGERank,
+	bool,
+) {
+	var bestRank BGERank
+	bestRank.rank = math.Inf(1)
+	found := false
+
+	prev := word[0]
+	pair := GPTPair{}
+	wordLen := len(word) // Calculate once
+
+	for idx := 1; idx < wordLen; idx++ {
+		present := word[idx]
+		pair.Left = prev
+		pair.Right = present
+		if rank, ok := bpeRanks[pair]; ok {
+			if rank < bestRank.rank {
+				bestRank = BGERank{rank, pair}
+				found = true
+			}
+		}
+		prev = present
+	}
+	return bestRank, found
+}
+
+// Standard version with proper duplicate checking
+func insertSortedNoDups(data BGERanks, v BGERank) BGERanks {
+	// Fast path: append to end if it's greater than all existing elements
+	if len(data) == 0 || data[len(data)-1].rank < v.rank {
 		return append(data, v)
 	}
 
-	// Make space for the inserted element by shifting
-	// values at the insertion index up one index. The call
-	// to append does not allocate memory when cap(data) is
-	// greater than len(data).
-	data = append(data[:i+1], data[i:]...)
-
-	// Insert the new element.
-	data[i] = v
-
-	// Return the updated slice.
-	return data
-}
-
-// insertSortedNoDups inserts v, a BGERank, into data and returns the new slice.
-// If v is already in data, it is not inserted again. It ensures that the slice
-// is sorted and has no duplicates.
-func insertSortedNoDups(data BGERanks, v BGERank) BGERanks {
 	i := sort.Search(
 		len(data), func(i int) bool {
 			return data[i].rank >= v.rank
 		},
 	)
-	if i < len(data) && data[i] == v {
+
+	// Check for exact duplicate using full BGERank comparison
+	if i < len(data) && data[i].rank == v.rank && data[i].bigram == v.bigram {
 		return data
 	}
-	return insertAt(data, i, v)
+
+	// Use optimized insertAt
+	if len(data) == cap(data) {
+		// Grow slice with extra space
+		newCap := cap(data) * 2
+		if newCap == 0 {
+			newCap = 4
+		}
+		newData := make([]BGERank, len(data), newCap)
+		copy(newData, data)
+		data = newData
+	}
+
+	// Extend length by one
+	data = data[:len(data)+1]
+
+	// Shift elements in a single operation
+	if i < len(data)-1 {
+		copy(data[i+1:], data[i:len(data)-1])
+	}
+
+	// Insert new element
+	data[i] = v
+	return data
 }
 
 func getPairs(word []string) []GPTPair {
@@ -735,17 +855,25 @@ func findAllStringsIndexes(text string, strings []string) [][]int {
 	return indexes
 }
 
+var wordBufferPool = sync.Pool{
+	New: func() interface{} {
+		s1 := make([]string, 0, 256)
+		s2 := make([]string, 0, 256)
+		return &[2][]string{s1, s2} // Return pair of buffers
+	},
+}
+
 // ToBPE
 // Given pre-split text, perform bigram ranking and merges, and returns Tokens
+// Add at package level - reusable buffers for common operations
 func (encoder *GPTEncoder) ToBPE(text string) Tokens {
-	// If the text is in the cache, return it.
 	if lookup, ok := encoder.Cache.Get(text); ok {
 		encoder.LruHits++
 		return lookup.(Tokens)
-	} else {
-		encoder.LruMisses++
 	}
-	// Lookup text given before proceeding
+	encoder.LruMisses++
+
+	// Early return for ignoreMerges case
 	if encoder.ignoreMerges {
 		if token, ok := encoder.Encoder[text]; ok {
 			encoder.Cache.Add(text, Tokens{token})
@@ -753,20 +881,25 @@ func (encoder *GPTEncoder) ToBPE(text string) Tokens {
 		}
 	}
 
-	// Split the text into words.
-	word := strings.Split(text, "")
-	word[len(word)-1] = word[len(word)-1] + encoder.endOfWord
-	rankedPairs := encoder.getRankedPairs(word)
+	// Get word buffer from pool
+	bufsPtr := wordBufferPool.Get().(*[2][]string)
+	word := (*bufsPtr)[0][:0]
+	newWord := (*bufsPtr)[1][:0]
+	defer wordBufferPool.Put(bufsPtr)
 
-	if len(rankedPairs) == 0 {
-		// If the word is a single rune, we can just encode it directly.
+	word = append(word, strings.Split(text, "")...)
+	if len(word) > 0 {
+		word[len(word)-1] = word[len(word)-1] + encoder.endOfWord
+	}
+
+	// Single character optimization
+	if len(word) == 1 {
 		var tokens Tokens
 		if token, ok := encoder.Encoder[word[0]]; ok {
 			tokens = Tokens{token}
 		} else if encoder.BytesEncoder != nil {
-			tokens = make(Tokens, 0)
+			tokens = make(Tokens, 0, len(word[0]))
 			runeBytes := []byte(word[0])
-			// Then encode each byte as a token.
 			for _, b := range runeBytes {
 				tokens = append(tokens, (*encoder.BytesEncoder)[b])
 			}
@@ -777,15 +910,18 @@ func (encoder *GPTEncoder) ToBPE(text string) Tokens {
 		return tokens
 	}
 
-	// Iterate over the ranked pairs and merge them.
+	// Main merge loop using findBestPair
 	for {
-		bigram := rankedPairs[0].bigram
-		if _, ok := encoder.BpeRanks[bigram]; !ok {
+		bestRank, found := findBestPair(word, encoder.BpeRanks)
+		if !found {
 			break
 		}
-		first := bigram.Left
-		second := bigram.Right
-		newWord := make([]string, 0, len(word))
+
+		// Reset newWord for reuse
+		newWord = newWord[:0]
+		first := bestRank.bigram.Left
+		second := bestRank.bigram.Right
+
 		for i := 0; i < len(word); {
 			j := pos(word, first, i)
 			if j == -1 {
@@ -794,6 +930,7 @@ func (encoder *GPTEncoder) ToBPE(text string) Tokens {
 			}
 			newWord = append(newWord, word[i:j]...)
 			i = j
+
 			if word[i] == first && i < len(word)-1 && word[i+1] == second {
 				newWord = append(newWord, first+second)
 				i += 2
@@ -802,40 +939,27 @@ func (encoder *GPTEncoder) ToBPE(text string) Tokens {
 				i += 1
 			}
 		}
-		word = newWord
 
-		// If we've reduced the word to a single token, we're done.
+		word, newWord = newWord, word
+
 		if len(word) == 1 {
 			break
-		} else {
-			rankedPairs = encoder.getRankedPairs(word)
 		}
 	}
 
-	// Encode the word into tokens.
-	if len(word) > 0 {
-		idx := len(word) - 1
-		word[idx] = word[idx]
-	}
-	tokens := make(Tokens, 0)
-
-	// If we have a special token, we cap it off.
+	// Final encoding
+	tokens := make(Tokens, 0, len(word))
 	for _, token := range word {
 		if lookup, ok := encoder.Encoder[token]; ok {
 			tokens = append(tokens, lookup)
 		} else if encoder.BytesEncoder != nil {
-			// If we can't find the token in the encoder, we'll
-			// encode it in byte-level BPE. First convert the rune
-			// into 8-bit bytes.
 			runeBytes := []byte(token)
-			// Then encode each byte as a token.
 			for _, b := range runeBytes {
 				tokens = append(tokens, (*encoder.BytesEncoder)[b])
 			}
 		}
 	}
 
-	// Cache the tokens.
 	encoder.Cache.Add(text, tokens)
 	return tokens
 }
@@ -892,82 +1016,93 @@ func (encoder *GPTEncoder) splitWords(
 }
 
 type NextRuneFunc func() (rune, int, error)
-type WordCallback func(*string)
-
-func (encoder *GPTEncoder) splitOntoChan(
-	text string, ch chan *string,
-	specialToken bool, specialsNode *RuneNode, wg *sync.WaitGroup,
-) {
-	defer close(ch)
-	words := encoder.splitWords(text, specialToken, specialsNode)
-	for _, word := range words {
-		ch <- word
-	}
-	wg.Done()
-}
-
-func (encoder *GPTEncoder) synchronousSplitterThread(
-	line string, specialToken bool, specialsNode *RuneNode,
-	wg *sync.WaitGroup,
-) chan *string {
-	retCh := make(chan *string, 16)
-	go encoder.splitOntoChan(line, retCh, specialToken, specialsNode, wg)
-	return retCh
-}
-
-func (encoder *GPTEncoder) consumeSplitQueue(
-	queue chan chan *string,
-	cb WordCallback,
-	wg *sync.WaitGroup,
-) {
-	for {
-		select {
-		case ch, ok := <-queue:
-			if !ok {
-				wg.Done()
-				return
-			}
-			for word := range ch {
-				cb(word)
-			}
-		}
-	}
-}
+type WordCallback func([]string)
 
 func (encoder *GPTEncoder) makeWordSplitter(
 	nextRuneFunc NextRuneFunc,
 	wordCallback WordCallback,
 	completeCallback func(),
 ) func() {
-	workQueue := make(chan chan *string, encoder.SplitterThreads)
+	// How many words we send on each callback.
+	const batchSize = 256
+	workQueue := make(chan []string, encoder.SplitterThreads*2)
 	wg := sync.WaitGroup{}
 	wg.Add(1)
-	go encoder.consumeSplitQueue(workQueue, wordCallback, &wg)
+
+	// Single consumer goroutine that processes batches
+	go func() {
+		defer wg.Done()
+		for batch := range workQueue {
+			wordCallback(batch)
+		}
+	}()
 
 	return func() {
 		specialsRuneRoot := encoder.SpecialsTree
 		runeAccumulator := make([]rune, 0, encoder.runeBufSz)
+		wordBatch := make([]string, 0, batchSize)
 		specialToken := false
 		specialsCandidates := make(RuneNodes, 0, 16)
 		var candidateNode *RuneNode
+
+		flushBatch := func() {
+			if len(wordBatch) > 0 {
+				// Copy the batch to prevent race conditions
+				batch := make([]string, len(wordBatch))
+				copy(batch, wordBatch)
+				workQueue <- batch
+				wordBatch = wordBatch[:0]
+			}
+		}
+
+		processLine := func(line string, special bool, node *RuneNode) {
+			// Process replacements and normalization
+			for replaced, replacement := range encoder.replacements {
+				line = strings.ReplaceAll(line, replaced, replacement)
+			}
+			line = encoder.Normalizer.Replace(line)
+
+			// Find all words
+			matches := encoder.pattern.FindAllString(line, -1)
+			for _, match := range matches {
+				word := match
+				if encoder.lowerCase {
+					word = strings.ToLower(word)
+				}
+				if !encoder.prefixSpace {
+					word = strings.TrimSpace(word)
+				}
+				if len(word) > 0 {
+					wordBatch = append(wordBatch, word)
+					if len(wordBatch) >= batchSize {
+						flushBatch()
+					}
+				}
+			}
+
+			if special && node != nil {
+				special := string(node.runes)
+				wordBatch = append(wordBatch, special)
+				if len(wordBatch) >= batchSize {
+					flushBatch()
+				}
+			}
+		}
+
 		checkAndReplaceNode := func() {
-			// We have a replacement, so we need to replace the
-			// runes that we've matched in the accumulator with
-			// the replacement.
 			matchLen := len(candidateNode.runes)
 			accTruncIdx := len(runeAccumulator) - matchLen
 			runeAccumulator = append(
 				runeAccumulator[:accTruncIdx],
 				*candidateNode.replacement...,
 			)
-			// Reset our states.
 			specialsCandidates = specialsCandidates[:0]
 			candidateNode = specialsRuneRoot
 			specialToken = false
 		}
+
 		for {
-			// Let's collect runes until we reach the end of our IO stream, or
-			// hit a newline.
+			// Collect runes until newline or special token
 			for {
 				r, size, err := nextRuneFunc()
 				if size == 0 || err != nil {
@@ -980,8 +1115,6 @@ func (encoder *GPTEncoder) makeWordSplitter(
 					break
 				}
 
-				// Evaluate our specialsCandidate in place, and if we have
-				// a node returned, then we have a terminal node.
 				candidateNode = specialsCandidates.evaluate(r)
 				if candidateNode != nil {
 					if candidateNode.replacement != nil {
@@ -991,9 +1124,7 @@ func (encoder *GPTEncoder) makeWordSplitter(
 						break
 					}
 				}
-				// Otherwise, we evaluate this rune against our root node, to
-				// see if we have another candidate to start and add to our
-				// list.
+
 				candidateNode = specialsRuneRoot.evaluate(r)
 				if candidateNode != nil {
 					specialsCandidates = append(
@@ -1009,19 +1140,13 @@ func (encoder *GPTEncoder) makeWordSplitter(
 				}
 			}
 
-			// If we have no runes, then we've hit an error, or reached the end
-			// of our IO stream.
 			if len(runeAccumulator) == 0 {
+				flushBatch()
 				wordCallback(nil)
 				break
 			}
 
-			// If we've discovered a special token, then we need to split the
-			// runeAccumulator before the special token.
 			var line string
-			// Some tokenizers like Nerdstash will have a special token that consists
-			// of multiple smaller special tokens. We need to handle this case. so we don't split
-			// the line prematurely.
 			if specialToken {
 				line = string(
 					runeAccumulator[:len(runeAccumulator)-len(
@@ -1033,57 +1158,52 @@ func (encoder *GPTEncoder) makeWordSplitter(
 			}
 			runeAccumulator = runeAccumulator[:0]
 
-			// We split all words before the special token in question, and
-			// accumulate them.
-			wg.Add(1)
-			workQueue <- encoder.synchronousSplitterThread(
-				line, specialToken,
-				candidateNode, &wg,
-			)
+			processLine(line, specialToken, candidateNode)
 
-			// Reset our special tokens state.
 			candidateNode = specialsRuneRoot
 			specialToken = false
 			specialsCandidates = specialsCandidates[:0]
 		}
+
 		close(workQueue)
 		wg.Wait()
 		completeCallback()
 	}
 }
 
-// WordSplitter
-// Returns an iterator function that reads from an io.RuneReader and splits
-// the input into words. Each invocation of the iterator function returns
-// one word or nil if there are no more words.
 func (encoder *GPTEncoder) WordSplitter(reader io.RuneReader) func() *string {
-	wordsAccumulator := make(chan string, encoder.wordChanSz)
+	moreWords := make(chan []string, encoder.wordChanSz)
 	wordSplitter := encoder.makeWordSplitter(
-		func() (rune, int, error) {
-			return reader.ReadRune()
-		},
-		func(word *string) {
-			if word != nil {
-				wordsAccumulator <- *word
+		reader.ReadRune,
+		func(words []string) {
+			if len(words) > 0 {
+				moreWords <- words
 			}
 		},
 		func() {
-			close(wordsAccumulator)
+			close(moreWords)
 		},
 	)
 	go wordSplitter()
 
+	var wordsBuffer []string
+	idx := 1
+
 	return func() *string {
-		word, more := <-wordsAccumulator
-		if more {
-			return &word
+		var more bool
+		if idx >= len(wordsBuffer) {
+			wordsBuffer, more = <-moreWords
+			if !more {
+				return nil
+			}
+			idx = 1
 		} else {
-			return nil
+			idx++
 		}
+		return &wordsBuffer[idx-1]
 	}
 }
 
-// SplitWords splits a string into words according to BPE Encoder rules.
 func (encoder *GPTEncoder) SplitWords(text *string) *[]string {
 	words := make([]string, 0)
 	nextWord := encoder.WordSplitter(strings.NewReader(*text))
@@ -1118,66 +1238,77 @@ func (encoder *GPTEncoder) encodeTokens(tokens *[]string) (encoded Tokens) {
 	return encoded
 }
 
-// StreamingEncode is a streaming Encoder. It takes an io.RuneReader and
-// returns an iterator function that will return Tokens on each call.
+var tokenAccumulatorPool = sync.Pool{
+	New: func() interface{} {
+		// Size based on typical artifact size - adjust if needed
+		tokens := make(Tokens, 0, 65536)
+		return &tokens
+	},
+}
+
 func (encoder *GPTEncoder) StreamingEncode(reader io.RuneReader) func(int) *Tokens {
 	nextWord := encoder.WordSplitter(reader)
 
-	accumulator := make(Tokens, 0, 16384)
-	eosReturned := false
+	// Get accumulator from pool
+	accumulatorPtr := tokenAccumulatorPool.Get().(*Tokens)
+	accumulator := (*accumulatorPtr)[:0] // Reset length but keep capacity
+
 	if encoder.encloseEosBos || encoder.encloseBos {
 		accumulator = append(accumulator, encoder.BosToken)
 	}
 
+	eosReturned := false
+
 	return func(desiredTokens int) *Tokens {
 		for {
-			// If we have enough tokens, then we return them, and reset the
-			// accumulator.
-			if len(accumulator) > desiredTokens+1 {
-				chunk := accumulator[:desiredTokens]
-				accumulator = accumulator[desiredTokens:]
+			if len(accumulator) >= desiredTokens {
+				chunk := make(Tokens, desiredTokens)
+				copy(chunk, accumulator[:desiredTokens])
+
+				// Preserve capacity while shifting remaining tokens
+				copy(accumulator, accumulator[desiredTokens:])
+				accumulator = accumulator[:len(accumulator)-desiredTokens]
 				return &chunk
 			}
-			// Fetch the next word from the WordSplitter.
+
 			word := nextWord()
-			// If we have no word, then we're done.
 			if word == nil {
 				if (encoder.encloseEosBos || encoder.encloseEos) && !eosReturned {
 					accumulator = append(accumulator, encoder.EosToken)
 					eosReturned = true
 				}
-				// If we have any tokens left, then we return them.
+
 				if len(accumulator) > 0 {
-					chunk := accumulator
+					chunk := make(Tokens, len(accumulator))
+					copy(chunk, accumulator)
 					accumulator = accumulator[:0]
 					return &chunk
-				} else {
-					return nil
 				}
+
+				// Return accumulator to pool when done
+				tokenAccumulatorPool.Put(accumulatorPtr)
+				return nil
 			}
-			// Otherwise, we add the word to the accumulator. We have to
-			// handle the special tokens here, since they're not in vocab.
+
 			var encodedTokens Tokens
-			specialToken, isSpecial := encoder.Specials[*word]
-			if isSpecial {
-				decodedSpecial := string(encoder.Decoder[specialToken[0]])
-				encodedTokens = Tokens{encoder.Encoder[decodedSpecial]}
+			if specialToken, isSpecial := encoder.Specials[*word]; isSpecial {
+				encodedTokens = Tokens{
+					encoder.Encoder[string(encoder.Decoder[specialToken[0]])],
+				}
 			} else {
 				fragment := encoder.toUnicode(word)
 				encodedTokens = encoder.ToBPE(fragment)
 			}
 			accumulator = append(accumulator, encodedTokens...)
 
-			// If we're ignoring merges in `ToBPE`, we don't want to do
-			// accumulation-merges here.
 			if encoder.ignoreMerges {
 				continue
 			}
-			if len(accumulator)-len(encodedTokens) > 0 {
-				idx := len(accumulator) - len(encodedTokens) - 1
-				for {
-					pair := TokenPair{accumulator[idx],
-						accumulator[idx+1]}
+
+			if offsetIdx := len(accumulator) - len(encodedTokens) - 1; offsetIdx >= 0 {
+				idx := offsetIdx
+				for idx < len(accumulator)-1 {
+					pair := TokenPair{accumulator[idx], accumulator[idx+1]}
 					if merged, ok := encoder.TokenMerges[pair]; ok && merged != 0 {
 						before := accumulator[:idx]
 						var after Tokens
@@ -1187,13 +1318,10 @@ func (encoder *GPTEncoder) StreamingEncode(reader io.RuneReader) func(int) *Toke
 						accumulator = append(before, merged)
 						accumulator = append(accumulator, after...)
 						if idx > 0 {
-							idx -= 1
+							idx--
 						}
 					} else {
-						idx += 1
-					}
-					if idx >= len(accumulator)-1 {
-						break
+						idx++
 					}
 				}
 			}
@@ -1335,7 +1463,10 @@ func (encoder *GPTEncoder) Decode(encoded *Tokens) (text string) {
 
 // DecodeBuffer
 // Decode Tokens from a byte array into a string.
-func (encoder *GPTEncoder) DecodeBuffer(encoded *[]byte, useUint32 bool) (text string) {
+func (encoder *GPTEncoder) DecodeBuffer(
+	encoded *[]byte,
+	useUint32 bool,
+) (text string) {
 	// First convert our bytearray into uint32 `Token` array.
 	var tokens *Tokens
 	if useUint32 {

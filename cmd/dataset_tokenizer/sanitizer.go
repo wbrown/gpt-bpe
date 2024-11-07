@@ -204,11 +204,13 @@ func (runeReader SanitizedRuneReader) nextBuffer() *bytes.Buffer {
 	return stringBuffer
 }
 
-// ReadRune implements the bytes.RuneReader interface. It returns the next rune
-// from the sanitized reader, along with the size of the rune, and whether or
-// not there are any more runes to read.
-func (runeReader SanitizedRuneReader) ReadRune() (r rune, size int,
-	err error) {
+// ReadRune implements the bytes.RuneReader interface. It returns the next
+// rune from the sanitized reader, along with the size of the rune, and
+// whether or not there are any more runes to read.
+func (runeReader SanitizedRuneReader) ReadRune() (
+	r rune, size int,
+	err error,
+) {
 	if *runeReader.currBuffer == nil {
 		return 0, 0, io.EOF
 	} else if r, size, err = (*runeReader.currBuffer).ReadRune(); err != nil {
@@ -223,9 +225,9 @@ func (runeReader SanitizedRuneReader) ReadRune() (r rune, size int,
 	}
 }
 
-// CreateTextSanitizer creates a SanitizedRuneReader that consumes an io.Reader
-// and sanitizes the text it reads. The returned SanitizedRuneReader can be used
-// to read scrubbed runes from the io.Reader.
+// CreateTextSanitizer creates a SanitizedRuneReader that consumes an
+// io.Reader and sanitizes the text it reads. The returned
+// SanitizedRuneReader can be used to read scrubbed runes from the io.Reader.
 func CreateTextSanitizer(handle io.Reader) SanitizedRuneReader {
 	extraWhiteSpace := regexp.MustCompile("[[:space:]]+")
 	scanner := bufio.NewReaderSize(handle, 8*1024*1024)
@@ -258,9 +260,10 @@ func CreateTextSanitizer(handle io.Reader) SanitizedRuneReader {
 	return sanitizer
 }
 
-// SanitizeText sanitizes a text file, removing extra whitespace, and replacing
-// escaped newlines with actual newlines, and scrubbing	colons with leading
-// spaces, replacing tabs with spaces, and dropping Windows carriage returns.
+// SanitizeText sanitizes a text file, removing extra whitespace, and
+// replacing escaped newlines with actual newlines, and scrubbing colons
+// with leading spaces, replacing tabs with spaces, and dropping Windows
+// carriage returns.
 func SanitizeText(text string) string {
 	reader := CreateTextSanitizer(bytes.NewBufferString(text))
 	runes := make([]rune, 0)
