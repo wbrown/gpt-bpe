@@ -257,6 +257,7 @@ func TestEncodeText1(t *testing.T) {
 
 	total, writeErr := WriteContexts(
 		outputFile,
+		strings.ReplaceAll(outputFile, ".chunk", ".index"),
 		contexts,
 		enc,
 		sampling,
@@ -337,6 +338,7 @@ func TestSampling50(t *testing.T) {
 
 		total, writeErr := WriteContexts(
 			outputFile,
+			strings.ReplaceAll(outputFile, ".chunk", ".index"),
 			contexts,
 			enc,
 			sampling,
@@ -392,6 +394,7 @@ func TestSampling50(t *testing.T) {
 
 		total2, writeErr := WriteContexts(
 			outputFile,
+			strings.ReplaceAll(outputFile, ".chunk", ".index"),
 			contexts,
 			enc,
 			sampling,
@@ -465,6 +468,7 @@ func TestShuffle(t *testing.T) {
 
 		total, writeErr := WriteContexts(
 			outputFile,
+			strings.ReplaceAll(outputFile, ".chunk", ".index"),
 			contexts,
 			enc,
 			sampling,
@@ -519,6 +523,7 @@ func TestShuffle(t *testing.T) {
 
 		total2, writeErr := WriteContexts(
 			outputFile,
+			strings.ReplaceAll(outputFile, ".chunk", ".index"),
 			contexts2,
 			enc2,
 			sampling,

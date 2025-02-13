@@ -5,16 +5,18 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
-	"github.com/pkg/errors"
 	"io"
 	"log"
 	"math"
 	"regexp"
+	"regexp/syntax"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"unicode"
+
+	"github.com/pkg/errors"
 
 	lru "github.com/hashicorp/golang-lru"
 	"github.com/wbrown/gpt_bpe/resources"
@@ -29,45 +31,53 @@ const defaultPadTokenString = "[PAD]"
 type Token = types.Token
 type Tokens = types.Tokens
 
+type TypedTwoTierCache struct {
+	// Filler
+	filler int
+}
+
 type GPTEncoder struct {
-	Encoder         map[string]Token
-	Decoder         map[Token][]byte
-	BpeRanks        map[GPTPair]float64
-	TokenMerges     map[TokenPair]Token
-	BytesEncoder    *map[byte]Token
-	unitrim         []int
-	pattern         *regexp.Regexp
-	puncPat         *regexp.Regexp
-	specialsPat     *regexp.Regexp
-	byteToRune      [256]rune
-	runeToByte      map[rune]byte
-	Specials        map[string]Tokens
-	SpecialsTree    *RuneNode
-	Cache           *lru.ARCCache
-	TwoTierCache    *TypedTwoTierCache
-	PuncRunes       []rune
-	Normalizer      *strings.Replacer
-	DecodeExtra     *strings.Replacer
-	BosToken        Token
-	EosToken        Token
-	PadToken        Token
-	ignoreMerges    bool
-	encloseEosBos   bool
-	encloseBos      bool
-	encloseEos      bool
-	prefixSpace     bool
-	lowerCase       bool
-	endOfWord       string
-	replacements    map[string]string
-	runeBufSz       int
-	wordChanSz      int
-	LruHits         int
-	LruMisses       int
-	LruEvictions    int
-	LruSize         int
-	SplitterThreads int
-	VocabId         string
-	tokenizerClass  string
+	Encoder               map[string]Token
+	Decoder               map[Token][]byte
+	BpeRanks              map[GPTPair]float64
+	TokenMerges           map[TokenPair]Token
+	BytesEncoder          *map[byte]Token
+	unitrim               []int
+	pattern               *regexp.Regexp
+	puncPat               *regexp.Regexp
+	specialsPat           *regexp.Regexp
+	byteToRune            [256]rune
+	runeToByte            map[rune]byte
+	Specials              map[string]Tokens
+	SpecialsTree          *RuneNode
+	Cache                 *lru.ARCCache
+	TwoTierCache          *TypedTwoTierCache
+	PuncRunes             []rune
+	Normalizer            *strings.Replacer
+	DecodeExtra           *strings.Replacer
+	BosToken              Token
+	EosToken              Token
+	PadToken              Token
+	ignoreMerges          bool
+	encloseEosBos         bool
+	encloseBos            bool
+	encloseEos            bool
+	prefixSpace           bool
+	lowerCase             bool
+	endOfWord             string
+	replacements          map[string]string
+	runeBufSz             int
+	wordChanSz            int
+	LruHits               int
+	LruMisses             int
+	LruEvictions          int
+	LruSize               int
+	SplitterThreads       int
+	VocabId               string
+	tokenizerClass        string
+	normalizerStringMap   map[string]string
+	regexWordSplitterTree *RegexNode
+	wordSplitterMap       [][]int
 }
 
 type GPTPair struct {
@@ -187,6 +197,7 @@ func (encoder *GPTEncoder) Clone() *GPTEncoder {
 	clone.PuncRunes = make([]rune, len(encoder.PuncRunes))
 	copy(clone.PuncRunes, encoder.PuncRunes)
 	clone.Normalizer = encoder.Normalizer
+	clone.normalizerStringMap = encoder.normalizerStringMap
 	clone.DecodeExtra = encoder.DecodeExtra
 	clone.Specials = make(map[string]Tokens)
 	for k, v := range encoder.Specials {
@@ -197,6 +208,8 @@ func (encoder *GPTEncoder) Clone() *GPTEncoder {
 		clone.replacements[k] = v
 	}
 	clone.runeBufSz = encoder.runeBufSz
+	clone.regexWordSplitterTree = encoder.regexWordSplitterTree
+	clone.wordSplitterMap = encoder.wordSplitterMap
 	return &clone
 }
 
@@ -205,7 +218,9 @@ func (encoder *GPTEncoder) Clone() *GPTEncoder {
 // id.
 func NewEncoder(vocabId string) (*GPTEncoder, error) {
 	log.Printf("Loading encoder for vocab id: %s\n", vocabId)
-	hfConfig, resourcesPtr, vocabErr := resources.ResolveVocabId(vocabId, "")
+	hfConfig, resourcesPtr, vocabErr := resources.ResolveVocabId(
+		vocabId, "",
+	)
 
 	if vocabErr != nil {
 		return nil, vocabErr
@@ -267,10 +282,13 @@ func NewEncoder(vocabId string) (*GPTEncoder, error) {
 
 	// Create a replacer for normalizing text.
 	normalizer := strings.NewReplacer()
+	norms := make([]string, 0)
+	normsMap := make(map[string]string)
 	if specialConfig.Normalizer != nil {
-		norms := make([]string, 0)
+
 		for k, v := range *specialConfig.Normalizer {
 			norms = append(norms, k, v)
+			normsMap[k] = v
 		}
 		normalizer = strings.NewReplacer(norms...)
 	}
@@ -364,7 +382,9 @@ func NewEncoder(vocabId string) (*GPTEncoder, error) {
 			specials[specialToken] = Tokens{encoderTokens[specialToken]}
 			specialsArr = append(specialsArr, specialToken)
 			quotedToken := regexp.QuoteMeta(specialToken)
-			specialsRegexTokens = append(specialsRegexTokens, quotedToken)
+			specialsRegexTokens = append(
+				specialsRegexTokens, quotedToken,
+			)
 		}
 	} else if specialsJson, ok := rsrcs["specials.json"]; ok {
 		specialsData := make(map[string]string)
@@ -381,7 +401,9 @@ func NewEncoder(vocabId string) (*GPTEncoder, error) {
 				specials[v] = Tokens{encoderTokens[v]}
 				specialsArr = append(specialsArr, v)
 				quotedToken := regexp.QuoteMeta(v)
-				specialsRegexTokens = append(specialsRegexTokens, quotedToken)
+				specialsRegexTokens = append(
+					specialsRegexTokens, quotedToken,
+				)
 			}
 		}
 	}
@@ -455,43 +477,46 @@ func NewEncoder(vocabId string) (*GPTEncoder, error) {
 
 	// Create the encoder
 	encoder := &GPTEncoder{
-		Encoder:         encoderTokens,
-		Decoder:         tokensEncoder,
-		BpeRanks:        bpeRanks,
-		TokenMerges:     tokenMerges,
-		BytesEncoder:    bytesEncoderPtr,
-		unitrim:         unitrimArr,
-		pattern:         pat,
-		puncPat:         puncPat,
-		specialsPat:     specialsPat,
-		byteToRune:      bytesUnicode,
-		runeToByte:      unicodeBytes,
-		Specials:        specials,
-		SpecialsTree:    nil,
-		Cache:           cache,
-		PuncRunes:       puncRunes,
-		Normalizer:      normalizer,
-		DecodeExtra:     decodeExtra,
-		BosToken:        encoderTokens[*hfConfig.BosTokenStr],
-		EosToken:        encoderTokens[*hfConfig.EosTokenStr],
-		PadToken:        encoderTokens[*hfConfig.PadTokenStr],
-		ignoreMerges:    *hfConfig.IgnoreMerges,
-		encloseEosBos:   specialConfig.EncloseEosBos,
-		encloseBos:      *hfConfig.AddBosToken,
-		encloseEos:      *hfConfig.AddEosToken,
-		prefixSpace:     specialConfig.PrefixSpace,
-		lowerCase:       specialConfig.LowerCase,
-		endOfWord:       specialConfig.EndOfWord,
-		replacements:    replacements,
-		runeBufSz:       RUNEBUF_SZ,
-		wordChanSz:      WORDCHAN_SZ,
-		LruHits:         0,
-		LruMisses:       0,
-		LruEvictions:    0,
-		LruSize:         BPE_LRU_SZ,
-		SplitterThreads: 2,
-		VocabId:         vocabId,
-		tokenizerClass:  *hfConfig.TokenizerClass,
+		Encoder:               encoderTokens,
+		Decoder:               tokensEncoder,
+		BpeRanks:              bpeRanks,
+		TokenMerges:           tokenMerges,
+		BytesEncoder:          bytesEncoderPtr,
+		unitrim:               unitrimArr,
+		pattern:               pat,
+		puncPat:               puncPat,
+		specialsPat:           specialsPat,
+		byteToRune:            bytesUnicode,
+		runeToByte:            unicodeBytes,
+		Specials:              specials,
+		SpecialsTree:          nil,
+		Cache:                 cache,
+		PuncRunes:             puncRunes,
+		Normalizer:            normalizer,
+		DecodeExtra:           decodeExtra,
+		BosToken:              encoderTokens[*hfConfig.BosTokenStr],
+		EosToken:              encoderTokens[*hfConfig.EosTokenStr],
+		PadToken:              encoderTokens[*hfConfig.PadTokenStr],
+		ignoreMerges:          *hfConfig.IgnoreMerges,
+		encloseEosBos:         specialConfig.EncloseEosBos,
+		encloseBos:            *hfConfig.AddBosToken,
+		encloseEos:            *hfConfig.AddEosToken,
+		prefixSpace:           specialConfig.PrefixSpace,
+		lowerCase:             specialConfig.LowerCase,
+		endOfWord:             specialConfig.EndOfWord,
+		replacements:          replacements,
+		runeBufSz:             RUNEBUF_SZ,
+		wordChanSz:            WORDCHAN_SZ,
+		LruHits:               0,
+		LruMisses:             0,
+		LruEvictions:          0,
+		LruSize:               BPE_LRU_SZ,
+		SplitterThreads:       2,
+		VocabId:               vocabId,
+		tokenizerClass:        *hfConfig.TokenizerClass,
+		normalizerStringMap:   normsMap,
+		regexWordSplitterTree: nil,
+		wordSplitterMap:       nil,
 	}
 	encoder.UpdateSpecialsTree()
 	return encoder, nil
@@ -1023,6 +1048,20 @@ func (encoder *GPTEncoder) makeWordSplitter(
 	wordCallback WordCallback,
 	completeCallback func(),
 ) func() {
+	if encoder.regexWordSplitterTree == nil {
+		regexString := encoder.pattern.String()
+		if regexString == "" {
+			regexString = SPLIT_REGEX
+		}
+		regexAST, err := syntax.Parse(regexString, syntax.Perl)
+		if err != nil {
+			panic(err)
+		}
+		regexAST.Simplify()
+		encoder.regexWordSplitterTree = CreateRegexTree(regexAST)
+		encoder.wordSplitterMap = encoder.regexWordSplitterTree.GeneratePathMap()
+	}
+
 	// How many words we send on each callback.
 	const batchSize = 256
 	workQueue := make(chan []string, encoder.SplitterThreads*2)
@@ -1045,6 +1084,7 @@ func (encoder *GPTEncoder) makeWordSplitter(
 		specialsCandidates := make(RuneNodes, 0, 16)
 		var candidateNode *RuneNode
 
+		// Define a function to flush the batch once it is full
 		flushBatch := func() {
 			if len(wordBatch) > 0 {
 				// Copy the batch to prevent race conditions
@@ -1055,23 +1095,23 @@ func (encoder *GPTEncoder) makeWordSplitter(
 			}
 		}
 
-		processLine := func(line string, special bool, node *RuneNode) {
-			// Process replacements and normalization
-			for replaced, replacement := range encoder.replacements {
-				line = strings.ReplaceAll(line, replaced, replacement)
+		// appendBatch appends a batch of words to the wordBatch and flushes
+		// the batch if it is full.
+		appendBatch := func(words []string, forceFlush bool) {
+			if len(words) == 0 && (!forceFlush || len(wordBatch) == 0) {
+				return
 			}
-			line = encoder.Normalizer.Replace(line)
-
-			// Find all words
-			matches := encoder.pattern.FindAllString(line, -1)
-			for _, match := range matches {
-				word := match
+			// If we are appending words, we need to process them
+			for _, word := range words {
 				if encoder.lowerCase {
 					word = strings.ToLower(word)
 				}
 				if !encoder.prefixSpace {
 					word = strings.TrimSpace(word)
 				}
+
+				// After every word, we append it to the wordBatch
+				// We also check if the wordBatch is full and flush it
 				if len(word) > 0 {
 					wordBatch = append(wordBatch, word)
 					if len(wordBatch) >= batchSize {
@@ -1079,16 +1119,54 @@ func (encoder *GPTEncoder) makeWordSplitter(
 					}
 				}
 			}
-
-			if special && node != nil {
-				special := string(node.runes)
-				wordBatch = append(wordBatch, special)
-				if len(wordBatch) >= batchSize {
-					flushBatch()
+			// forceFlush forces the batch to be flushed.
+			// Useful for ensuring that the last batch is flushed.
+			if forceFlush && len(wordBatch) > 0 {
+				// If we are forcing a flush, we flush the batch after processing
+				// the words
+				for i, word := range wordBatch {
+					if encoder.lowerCase {
+						word = strings.ToLower(word)
+					}
+					if !encoder.prefixSpace {
+						word = strings.TrimSpace(word)
+					}
+					wordBatch[i] = word
 				}
+
+				flushBatch()
 			}
 		}
 
+		processLine := func(
+			line []rune,
+			special bool,
+			node *RuneNode,
+		) {
+			// Find all words by using the regexWordSplitterTree
+			matches := encoder.regexWordSplitterTree.EvaluateRegexTree(
+				line, encoder.wordSplitterMap,
+			)
+			for _, word := range matches {
+				if encoder.lowerCase {
+					word = strings.ToLower(word)
+				}
+				if !encoder.prefixSpace {
+					word = strings.TrimSpace(word)
+				}
+				appendBatch([]string{word}, false)
+			}
+
+			// Re-add the special token if it was removed
+			// This is done after the regex splitting to ensure that the special
+			// token is not split by the regex
+			if special && node != nil {
+				special := string(node.runes)
+				appendBatch([]string{special}, false)
+			}
+		}
+
+		// Apply replacements defined in the runetree
 		checkAndReplaceNode := func() {
 			matchLen := len(candidateNode.runes)
 			accTruncIdx := len(runeAccumulator) - matchLen
@@ -1100,7 +1178,8 @@ func (encoder *GPTEncoder) makeWordSplitter(
 			candidateNode = specialsRuneRoot
 			specialToken = false
 		}
-
+		// We repeatedly call the nextRuneFunc until it returns an error or other break
+		// condition. This fills the runeAccumulator with runes until we have a full line.
 		for {
 			// Collect runes until newline or special token
 			for {
@@ -1115,6 +1194,7 @@ func (encoder *GPTEncoder) makeWordSplitter(
 					break
 				}
 
+				// Conduct replacement and special token checks
 				candidateNode = specialsCandidates.evaluate(r)
 				if candidateNode != nil {
 					if candidateNode.replacement != nil {
@@ -1140,31 +1220,45 @@ func (encoder *GPTEncoder) makeWordSplitter(
 				}
 			}
 
+			// If we have no runes, we are done
 			if len(runeAccumulator) == 0 {
-				flushBatch()
+				appendBatch(nil, true)
 				wordCallback(nil)
 				break
 			}
 
-			var line string
-			if specialToken {
-				line = string(
+			// Apply replacements and normalization
+			if specialToken && candidateNode != nil {
+				runeAccumulator =
 					runeAccumulator[:len(runeAccumulator)-len(
 						candidateNode.runes,
-					)],
-				)
-			} else {
-				line = string(runeAccumulator)
+					)]
 			}
+			if len(encoder.replacements) > 0 {
+				runeAccumulator = replaceRunes(
+					runeAccumulator, encoder.replacements,
+				)
+			}
+
+			if encoder.Normalizer != nil {
+				if encoder.normalizerStringMap != nil && len(encoder.normalizerStringMap) > 0 {
+					runeAccumulator = replaceRunes(
+						runeAccumulator, encoder.normalizerStringMap,
+					)
+				}
+			}
+			// If we don't recognize the regex, we default to using the regex package
+			processLine(
+				runeAccumulator, specialToken,
+				candidateNode,
+			)
 			runeAccumulator = runeAccumulator[:0]
-
-			processLine(line, specialToken, candidateNode)
-
 			candidateNode = specialsRuneRoot
 			specialToken = false
 			specialsCandidates = specialsCandidates[:0]
 		}
 
+		// Close the work queue and wait for all workers to finish
 		close(workQueue)
 		wg.Wait()
 		completeCallback()
@@ -1200,8 +1294,93 @@ func (encoder *GPTEncoder) WordSplitter(reader io.RuneReader) func() *string {
 		} else {
 			idx++
 		}
-		return &wordsBuffer[idx-1]
+		word := wordsBuffer[idx-1]
+		return &word
 	}
+}
+
+// Helper functions
+func trimSpacesRunes(runes []rune) []rune {
+	// Runespace trims leading and trailing spaces from a slice of runes
+	// and returns the trimmed slice.
+	start := 0
+	end := len(runes)
+	for start < end && unicode.IsSpace(runes[start]) {
+		start++
+	}
+	for end > start && unicode.IsSpace(runes[end-1]) {
+		end--
+	}
+	return runes[start:end]
+}
+
+func toLowercaseRunes(runes []rune) []rune {
+	// Runespace converts a slice of runes to lowercase and returns the
+	// lowercase slice.
+	for i := 0; i < len(runes); i++ {
+		runes[i] = unicode.ToLower(runes[i])
+	}
+	return runes
+}
+
+func replaceRunes(
+	runes []rune,
+	replacements map[string]string,
+) []rune {
+	runeReplacements := make(map[string][]rune, len(replacements))
+	for k, v := range replacements {
+		runeReplacements[k] = []rune(v)
+	}
+
+	// Iterate through runes
+	for i := 0; i < len(runes); i++ {
+		matchFound := false
+
+		// Iterate through replacements
+		for k, v := range runeReplacements {
+			if len(v) == 0 {
+				continue
+			}
+			if runes[i] == []rune(k)[0] {
+				matchFound = true
+				if len(v) > 1 {
+					// Try to get a slice of the runes to match the key, if it matches, replace it
+					keySlice := runes[i : i+len(k)]
+					for j := 0; j < len(keySlice); j++ {
+						if keySlice[j] != []rune(k)[j] {
+							matchFound = false
+							break
+						}
+					}
+					if matchFound {
+						runes = append(runes[:i], []rune(v)...)
+					}
+
+				} else {
+					runes[i] = v[0]
+				}
+			}
+		}
+		if !matchFound {
+			continue
+		}
+	}
+	return runes
+}
+
+// Excludes new line whitespaces. Thus is horizontal whitespace.
+func isHorizontalWhitespace(r rune) bool {
+	return r == ' ' || r == '\t' || r == '\r'
+}
+
+func isSymbol(r rune) bool {
+	return !unicode.IsLetter(r) && !unicode.IsNumber(r) && !isHorizontalWhitespace(r) && !isNewLine(r)
+}
+
+func isNewLine(r rune) bool {
+	// While \n is often considered a whitespace, we treat it as a symbol
+	// to ensure it is always a separate token.
+	return r == '\n'
 }
 
 func (encoder *GPTEncoder) SplitWords(text *string) *[]string {
@@ -1274,7 +1453,9 @@ func (encoder *GPTEncoder) StreamingEncode(reader io.RuneReader) func(int) *Toke
 			word := nextWord()
 			if word == nil {
 				if (encoder.encloseEosBos || encoder.encloseEos) && !eosReturned {
-					accumulator = append(accumulator, encoder.EosToken)
+					accumulator = append(
+						accumulator, encoder.EosToken,
+					)
 					eosReturned = true
 				}
 
@@ -1344,7 +1525,9 @@ func (encoder *GPTEncoder) EncodeReader(reader io.RuneReader) *Tokens {
 
 // EncodeBuffer takes a byte array and encodes it into Tokens in another
 // byte array.
-func (encoder *GPTEncoder) EncodeBuffer(buffer *[]byte) (*[]byte, uint64) {
+func (encoder *GPTEncoder) EncodeBuffer(buffer *[]byte) (
+	*[]byte, uint64,
+) {
 	runeReader := bytes.NewReader(*buffer)
 	nextTokens := encoder.StreamingEncode(runeReader)
 	buf := bytes.NewBuffer(make([]byte, 0, 4096))

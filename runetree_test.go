@@ -1,7 +1,9 @@
 package gpt_bpe
 
 import (
+	"fmt"
 	"io"
+	"regexp/syntax"
 	"strings"
 	"testing"
 )
@@ -122,12 +124,14 @@ var sanitizeTable = map[string]string{
 var encodingSanitzer = map[string]string{}
 
 func TestRuneNode_String(t *testing.T) {
+	nerdstashV2Encoder = *CacheLoadEncoder("nerdstash_v2-tokenizer")
 	print(nerdstashV2Encoder.SpecialsTree.String())
 }
 
 func TestRuneMatch(t *testing.T) {
 	s := "// TypeScript Version: 2.9"
 	rr := io.RuneReader(strings.NewReader(s))
+	nerdstashV2Encoder = *CacheLoadEncoder("nerdstash_v2-tokenizer")
 	nextWord := nerdstashV2Encoder.WordSplitter(rr)
 	for {
 		word := nextWord()
@@ -141,8 +145,10 @@ func TestRuneMatch(t *testing.T) {
 func TestRuneReplacement(t *testing.T) {
 	s := "Ã¹ TypeScriptÃ–"
 	rr := io.RuneReader(strings.NewReader(s))
+	nerdstashV2Encoder = *CacheLoadEncoder("nerdstash_v2-tokenizer")
 	nerdstashV2Encoder.SpecialsTree.InsertReplacementsIntoRuneTree(
-		sanitizeTable)
+		sanitizeTable,
+	)
 	print(nerdstashV2Encoder.SpecialsTree.String())
 	nextWord := nerdstashV2Encoder.WordSplitter(rr)
 	for {
@@ -152,4 +158,24 @@ func TestRuneReplacement(t *testing.T) {
 		}
 		t.Log(*word)
 	}
+}
+
+func TestRegex(t *testing.T) {
+	// This test is to check if the regex is able to split the text correctly
+	testStr := "This is a test.  This is another test. filler filler. fill'll fill't 1 12 123 1234 12345 123456 1234567\n The quick brown turtle did a backflip and won a marathon."
+	llama3Encoder = *CacheLoadEncoder("llama3-tokenizer")
+	regexStringLLama3 := llama3Encoder.pattern.String()
+	fmt.Printf("regexString: %v\n", regexStringLLama3)
+	regexASTLLama3, err := syntax.Parse(regexStringLLama3, syntax.Perl)
+	if err != nil {
+		t.Error(err)
+	}
+	regexASTLLama3.Simplify()
+
+	regexTree := CreateRegexTree(regexASTLLama3)
+	//regexTree.PrintTree()
+	runesTest := []rune(testStr)
+	pathMap := regexTree.GeneratePathMap()
+	returnedval := regexTree.EvaluateRegexTree(runesTest, pathMap)
+	fmt.Printf("returnedval: %v\n", returnedval)
 }

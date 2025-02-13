@@ -12,7 +12,6 @@ import (
 	"os"
 	"regexp"
 	"runtime"
-	"runtime/pprof"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +43,9 @@ var llama2Encoded *Tokens
 var llama3Encoded *Tokens
 var mistralEncoded *Tokens
 var unicodeTrimTests []*Tokens
+
+var benchmarkPrefix string
+var encoders map[string]*GPTEncoder
 
 const largeCorpusPath = "resources/wiki.train.raw.xz"
 
@@ -124,13 +126,30 @@ func getStringBounds(
 }
 
 func init() {
-	gpt2Encoder = NewGPT2Encoder()
-	pileEncoder = NewPileEncoder()
-	clipEncoder = NewCLIPEncoder()
-	nerdstashV2Encoder = NewNerdstashV2Encoder()
-	llama2Encoder = NewLlama2Encoder()
-	llama3Encoder = NewLlama3Encoder()
-	mistralEncoder = NewMistralEncoder()
+	isBench := isRunningBenchmarkTest()
+
+	// These will all be null
+	encoders = map[string]*GPTEncoder{
+		"gpt2-tokenizer":         &gpt2Encoder,
+		"pile-tokenizer":         &pileEncoder,
+		"clip-tokenizer":         &clipEncoder,
+		"nerdstash_v2-tokenizer": &nerdstashV2Encoder,
+		"llama-tokenizer":        &llama2Encoder,
+		"llama3-tokenizer":       &llama3Encoder,
+		"mistral-tokenizer":      &mistralEncoder,
+	}
+
+	// Load all encoders up front, as this is desirable for benchmarking
+	if isBench {
+		gpt2Encoder = *CacheLoadEncoder("gpt2-tokenizer")
+		pileEncoder = *CacheLoadEncoder("pile-tokenizer")
+		clipEncoder = *CacheLoadEncoder("clip-tokenizer")
+		nerdstashV2Encoder = *CacheLoadEncoder("nerdstash_v2-tokenizer")
+		llama2Encoder = *CacheLoadEncoder("llama-tokenizer")
+		llama3Encoder = *CacheLoadEncoder("llama3-tokenizer")
+		mistralEncoder = *CacheLoadEncoder("mistral-tokenizer")
+	}
+
 	textBytes := handleRead("resources/frankenstein.txt")
 	clipBytes := handleRead("resources/frankenstein_clip.txt")
 	corpus = string(textBytes)
@@ -141,6 +160,50 @@ func init() {
 	if err != nil {
 		log.Fatalf("Error opening `%s`: %v", largeCorpusPath, err)
 	}
+}
+
+// isRunningBenchmarkTest
+// Check if we're running a benchmark test
+// We assume a benchmark test is defined as a test
+// that begins with a BENCHMARK_PREFIX. This is
+// by default "Benchmark", but can be configured
+// by the environment variable BENCHMARK_PREFIX
+func isRunningBenchmarkTest() bool {
+	prefix, ok := os.LookupEnv("BENCHMARK_PREFIX")
+	if ok {
+		benchmarkPrefix = prefix
+	} else {
+		benchmarkPrefix = "Benchmark"
+	}
+
+	for _, arg := range os.Args {
+		parsedArg, err := regexp.Compile(arg)
+		if err != nil {
+			log.Fatalf("Failed parsing CLI args using regexp")
+		}
+		prefix, _ = parsedArg.LiteralPrefix()
+		if strings.HasPrefix(prefix, benchmarkPrefix) {
+			log.Println("Running benchmark test, so loading encoders up front...")
+			return true
+		}
+	}
+	return false
+}
+
+// CacheLoadEncoder
+// Loads an encoder, but only once
+func CacheLoadEncoder(vocabId string) *GPTEncoder {
+	if encoders[vocabId].Encoder == nil {
+		encoder, err := NewEncoder(vocabId)
+		if err != nil {
+			log.Fatalf("Error loading encoder `%s`: ", vocabId)
+		}
+
+		// Cache the encoder for later use
+		encoders[vocabId] = encoder
+		return encoder
+	}
+	return encoders[vocabId]
 }
 
 func GetLargeCorpus() (*string, error) {
@@ -215,6 +278,7 @@ func TestHFTokenzier(t *testing.T) {
 	}
 	sent := "The fox jumped over the hare."
 	hfTokens := enc.Encode(&sent)
+	gpt2Encoder = *CacheLoadEncoder("gpt2-tokenizer")
 	gptTokens := gpt2Encoder.Encode(&sent)
 	assert.Equal(t, hfTokens, gptTokens)
 }
@@ -239,6 +303,7 @@ var TrimNewLinesTests = append(
 func TestGPTEncoder_TrimIncompleteSentence(t *testing.T) {
 	testStr := "This is a test. He says, \"This is an unterminated quote. She says, this is actually terminated.\" This is awesome! This is incomplete "
 	expected := "This is a test. He says, \"This is an unterminated quote. She says, this is actually terminated.\" This is awesome!"
+	gpt2Encoder = *CacheLoadEncoder("gpt2-tokenizer")
 	trimmed, _ := gpt2Encoder.TrimIncompleteSentence(gpt2Encoder.Encode(&testStr))
 	output := gpt2Encoder.Decode(trimmed)
 	if expected != output {
@@ -247,6 +312,7 @@ func TestGPTEncoder_TrimIncompleteSentence(t *testing.T) {
 }
 
 func TestGPTEncoder_TrimTokens(t *testing.T) {
+	gpt2Encoder = *CacheLoadEncoder("gpt2-tokenizer")
 	for testIdx := range unicodeTrimTests {
 		assert.NotEqual(
 			t, len(
@@ -260,6 +326,7 @@ func TestGPTEncoder_TrimTokens(t *testing.T) {
 }
 
 func TestGPTEncoder_TrimNewlines(t *testing.T) {
+	gpt2Encoder = *CacheLoadEncoder("gpt2-tokenizer")
 	for testIdx := range TrimNewLinesTests {
 		test := TrimNewLinesTests[testIdx]
 		res, err := gpt2Encoder.TrimNewlines(
@@ -280,6 +347,7 @@ func TestGPTEncoder_TrimNewlines(t *testing.T) {
 }
 
 func TestGPTEncoder_TrimSentences(t *testing.T) {
+	gpt2Encoder = *CacheLoadEncoder("gpt2-tokenizer")
 	for testIdx := range TrimSentencesTests {
 		test := TrimSentencesTests[testIdx]
 		res, err := gpt2Encoder.TrimSentences(
@@ -329,6 +397,8 @@ var SplitTests = []SplitTest{
 }
 
 func TestGPTEncoder_Split(t *testing.T) {
+	gpt2Encoder = *CacheLoadEncoder("gpt2-tokenizer")
+
 	for testIdx := range SplitTests {
 		test := SplitTests[testIdx]
 		assert.Equal(t, test.Expected, *(gpt2Encoder.SplitWords(&test.Input)))
@@ -365,189 +435,6 @@ func OpenXZStream(path string) (*xz.Reader, *os.File, error) {
 	return decompressorHandle, corpusHandle, nil
 }
 
-func BenchmarkGPTEncoder_WordSplitterChan(b *testing.B) {
-	b.StopTimer()
-	gpt2Encoder.SplitterThreads = 8
-	corpusHandle := strings.NewReader(corpus)
-	nextWord := gpt2Encoder.WordSplitter(
-		bufio.NewReaderSize(
-			corpusHandle, 8*1024*1024,
-		),
-	)
-
-	start := time.Now()
-	b.StartTimer()
-	wordCount := 0
-	for {
-		word := nextWord()
-		if word == nil {
-			break
-		}
-		wordCount++
-	}
-	b.StopTimer()
-	elapsed := time.Since(start)
-	b.ReportMetric(float64(wordCount)/elapsed.Seconds(), "words/sec")
-	b.ReportMetric(float64(wordCount), "words")
-}
-
-func BenchmarkGPTEncoder_WordSplitter(b *testing.B) {
-	b.StopTimer()
-	corpusHandle := strings.NewReader(*largeCorpus)
-	gpt2Encoder.SplitterThreads = 8
-	wordCount := 0
-	runeReader := bufio.NewReaderSize(corpusHandle, 8*1024*1024)
-	profileHandle, _ := os.Create("wordsplitter.prof")
-	runtime.GC()
-	pprof.StartCPUProfile(profileHandle)
-	wordSplitter := gpt2Encoder.makeWordSplitter(
-		runeReader.ReadRune,
-		func(words []string) {
-			wordCount += len(words)
-		},
-		func() {},
-	)
-	start := time.Now()
-	b.StartTimer()
-	wordSplitter()
-	b.StopTimer()
-	pprof.StopCPUProfile()
-	elapsed := time.Since(start)
-	numBytes := len(*largeCorpus)
-	b.ReportMetric(float64(wordCount)/elapsed.Seconds(), "words/sec")
-	b.ReportMetric(float64(wordCount), "words")
-	b.ReportMetric(float64(numBytes)/elapsed.Seconds(), "bytes/sec")
-	b.ReportMetric(float64(numBytes), "bytes")
-}
-
-func BenchmarkGPTEncoder_ToBPE(b *testing.B) {
-	b.StopTimer()
-
-	// Pre-split words
-	words := *nerdstashV2Encoder.SplitWords(largeCorpus)
-
-	// Pre-calculate tokens for each word
-	tokenLengths := make([]int, len(words))
-	totalTokens := 0
-	for i, word := range words {
-		tokens := nerdstashV2Encoder.ToBPE(word)
-		tokenLengths[i] = len(tokens)
-		totalTokens += tokenLengths[i]
-	}
-	profileHandle, _ := os.Create("tobpe.prof")
-
-	numBytes := len(*largeCorpus)
-	start := time.Now()
-
-	b.StartTimer()
-	runtime.GC()
-	pprof.StartCPUProfile(profileHandle)
-	for i := 0; i < b.N; i++ {
-		for idx := range words {
-			// Just do the ToBPE call without length calculation
-			nerdstashV2Encoder.ToBPE(words[idx])
-		}
-	}
-	pprof.StopCPUProfile()
-	b.StopTimer()
-
-	elapsed := time.Since(start)
-	totalTokens *= b.N
-
-	// Use pre-calculated values for metrics
-	b.ReportMetric(float64(numBytes)/elapsed.Seconds(), "bytes/sec")
-	b.ReportMetric(float64(numBytes), "bytes")
-	b.ReportMetric(float64(totalTokens)/elapsed.Seconds(), "tokens/sec")
-	b.ReportMetric(float64(totalTokens), "tokens")
-	// Report on tokenizer LRU cache
-	b.ReportMetric(float64(nerdstashV2Encoder.LruHits), "lru_hits")
-	b.ReportMetric(float64(nerdstashV2Encoder.LruMisses), "lru_misses")
-	b.ReportMetric(float64(nerdstashV2Encoder.LruEvictions), "lru_evictions")
-
-}
-
-func BenchmarkGPTEncoder_WordSplitterTokens(b *testing.B) {
-	b.StopTimer()
-	wordCount := 0
-	tokensCount := 0
-	corpusHandle := strings.NewReader(corpus)
-	runeReader := bufio.NewReaderSize(corpusHandle, 8*1024*1024)
-
-	wordSplitter := nerdstashV2Encoder.makeWordSplitter(
-		runeReader.ReadRune,
-		func(words []string) {
-			if len(words) > 0 {
-				for _, word := range words {
-					tokensCount += len(nerdstashV2Encoder.ToBPE(word))
-				}
-			}
-			wordCount++
-		},
-		func() {},
-	)
-	start := time.Now()
-	b.StartTimer()
-	wordSplitter()
-	b.StopTimer()
-	elapsed := time.Since(start)
-	//numBytes := int64(len(corpusText))
-	b.ReportMetric(float64(wordCount)/elapsed.Seconds(), "words/sec")
-	b.ReportMetric(float64(wordCount), "words")
-	b.ReportMetric(float64(tokensCount)/elapsed.Seconds(), "tokens/sec")
-	b.ReportMetric(float64(tokensCount), "tokens")
-}
-
-//func BenchmarkGPTEncoder_WordSplitterTokensChan(b *testing.B) {
-//	b.StopTimer()
-//	corpusHandle, err := os.Open(largeCorpusPath)
-//	//corpusText, err := ioutil.ReadFile(largeCorpusPath)
-//	nerdstashEncoder.SplitterThreads = 1
-//	//defer corpusHandle.Close()
-//	if err != nil {
-//		b.Error(err)
-//	}
-//	wordCount := 0
-//	tokensCount := 0
-//	runeReader := bufio.NewReaderSize(corpusHandle, 8*1024*1024)
-//	wordsChan := make(chan *string, 1000)
-//	go nerdstashEncoder.splitWordsOntoChan(runeReader.ReadRune,
-//		wordsChan)
-//	start := time.Now()
-//	b.StartTimer()
-//	for {
-//		word := <-wordsChan
-//		if word == nil {
-//			break
-//		}
-//		tokensCount += len(gpt2Encoder.ToBPE(*word))
-//		wordCount++
-//	}
-//	b.StopTimer()
-//	elapsed := time.Since(start)
-//	//numBytes := int64(len(corpusText))
-//	numBytes, _ := corpusHandle.Seek(0, io.SeekCurrent)
-//	b.ReportMetric(float64(wordCount)/elapsed.Seconds(), "words/sec")
-//	b.ReportMetric(float64(wordCount), "words")
-//	b.ReportMetric(float64(numBytes)/elapsed.Seconds(), "bytes/sec")
-//	b.ReportMetric(float64(numBytes), "bytes")
-//	b.ReportMetric(float64(tokensCount)/elapsed.Seconds(), "tokens/sec")
-//	b.ReportMetric(float64(tokensCount), "tokens")
-//}
-
-func BenchmarkGPTEncoder_Decode(b *testing.B) {
-	if gpt2Encoded == nil {
-		corpEncoded := gpt2Encoder.Encode(&corpus)
-		gpt2Encoded = corpEncoded
-	}
-	start := time.Now()
-	tokenNumBytes := len(gpt2Encoder.Decode(gpt2Encoded))
-	duration := time.Since(start)
-	b.Logf(
-		"%v tokens into %v bytes over %v",
-		len(*gpt2Encoded), tokenNumBytes, duration,
-	)
-}
-
 type EncoderTest struct {
 	Input             string
 	GPT2Expected      Tokens
@@ -580,28 +467,9 @@ var GPTEncoderTests = []EncoderTest{
 	},
 }
 
-func BenchmarkGPTEncoder_Encode(b *testing.B) {
-	start := time.Now()
-	tokenCt := len(*gpt2Encoder.Encode(&corpus))
-	duration := time.Since(start)
-	b.Logf(
-		"%v bytes into %v tokens over %v",
-		len(corpus), tokenCt, duration,
-	)
-}
-
-func BenchmarkGPTEncoder_EncodeBuffer(b *testing.B) {
-	corpusBytes := []byte(corpus)
-	start := time.Now()
-	_, tokenCt := gpt2Encoder.EncodeBuffer(&corpusBytes)
-	duration := time.Since(start)
-	b.Logf(
-		"%v bytes into %v tokens over %v",
-		len(corpus), tokenCt, duration,
-	)
-}
-
 func TestGPTEncoder_Encode(t *testing.T) {
+	gpt2Encoder = *CacheLoadEncoder("gpt2-tokenizer")
+
 	// This test is to check if the GPTEncoder is able to encode the tokens correctly
 	start := time.Now()
 	tokenCt := len(*gpt2Encoder.Encode(&corpus))
@@ -621,6 +489,7 @@ func TestGPTEncoder_Encode(t *testing.T) {
 func TestGPTEncoder_StreamingEncode(t *testing.T) {
 	// This test is to check if the GPTEncoder is able to encode the tokens
 	// correctly
+	gpt2Encoder = *CacheLoadEncoder("gpt2-tokenizer")
 	start := time.Now()
 	corpusRunes := strings.NewReader(*largeCorpus)
 	// Set our profiler up
@@ -646,6 +515,8 @@ func TestGPTEncoder_StreamingEncode(t *testing.T) {
 }
 
 func TestCLIPEncoder_Encode(t *testing.T) {
+	clipEncoder = *CacheLoadEncoder("clip-tokenizer")
+
 	// This test is to check if the CLIPEncoder is able to encode the tokens correctly
 	start := time.Now()
 	tokenCt := len(*clipEncoder.Encode(&corpus))
@@ -662,6 +533,8 @@ func TestCLIPEncoder_Encode(t *testing.T) {
 }
 
 func TestPileEncoder_Encode(t *testing.T) {
+	pileEncoder = *CacheLoadEncoder("pile-tokenizer")
+
 	// This test is to check if the PileEncoder is able to encode the tokens correctly
 	start := time.Now()
 	tokenCt := len(*pileEncoder.Encode(&corpus))
@@ -681,6 +554,8 @@ func TestPileEncoder_Encode(t *testing.T) {
 func TestNerdstashEncoder_Encode(t *testing.T) {
 	// This test is to check if the NerdstashEncoder is able to encode the tokens correctly
 	start := time.Now()
+	nerdstashV2Encoder = *CacheLoadEncoder("nerdstash_v2-tokenizer")
+
 	tokenCt := len(*nerdstashV2Encoder.Encode(&corpus))
 	duration := time.Since(start)
 	t.Logf(
@@ -696,6 +571,8 @@ func TestNerdstashEncoder_Encode(t *testing.T) {
 }
 
 func TestNerdstashEncoder_EncodeSpaces(t *testing.T) {
+	nerdstashV2Encoder = *CacheLoadEncoder("nerdstash_v2-tokenizer")
+
 	// This test is to check if the NerdstashEncoder is able to encode spaces correctly
 	testString := "        12 => '',\n"
 	expected := Tokens{16, 124, 125, 10631, 1695, 49231, 85}
@@ -704,6 +581,8 @@ func TestNerdstashEncoder_EncodeSpaces(t *testing.T) {
 }
 
 func TestNerdstashEncoder_Encode2(t *testing.T) {
+	nerdstashV2Encoder = *CacheLoadEncoder("nerdstash_v2-tokenizer")
+
 	// read the jsonl test file in
 	testFile, err := os.Open("resources/subset.jsonl")
 	if err != nil {
@@ -769,6 +648,8 @@ func TestNerdstashEncoder_Encode2(t *testing.T) {
 }
 
 func TestNerdstashEncoder_Decode(t *testing.T) {
+	nerdstashV2Encoder = *CacheLoadEncoder("nerdstash_v2-tokenizer")
+
 	// This test is to check if the NerdstashEncoder is able to decode the tokens correctly
 	for testIdx := range GPTEncoderTests {
 		decodedStr := nerdstashV2Encoder.Decode(
@@ -779,6 +660,8 @@ func TestNerdstashEncoder_Decode(t *testing.T) {
 }
 
 func TestGPTEncoder_Decode2(t *testing.T) {
+	gpt2Encoder = *CacheLoadEncoder("gpt2-tokenizer")
+
 	// This test is to check if the GPTEncoder is able to decode the tokens correctly from a base64 encoded string
 	gpt2EncodedCorpus := "NrGIEOQBRzFfAQEBCAE5GeADPCFGAQhdBgFhBkcHXwEBATM5HgGilUYBpAdDEaUheR8iAQEBmgSnbyQpRgHIjaYBiSQYLfoHYwHogg0A0AHsGFUmpgEGAcd0qApjAzwa7hscAeHAYwEGAbYRB3UiAax0PQPjAgoXpgEGAZgE6G2gAWMExy5GAb5szQdGAXUBAR2gAVQBRgG8CdYBYbCgAe4QAxg/NA0AdyoiAZMGOXL8AWlmAQGgFXknNlIGAdADLiciAT4B6lk="
 	decodedCorpus := "frying whatever they touched with a sizzled smell that fills the air along with a shower of sparks that land harmlessly elsewhere and a few stray drops that drip from fingers burned black as charcoal.The shock waves from the blasts cause many nearby trees to topple as the earth shakes and trembles underfoot from the power unleashed by each blast that destroys anything that was struck by it that wasn't shielded by heavy metal plates."
@@ -795,6 +678,8 @@ func TestGPTEncoder_Decode2(t *testing.T) {
 }
 
 func TestGPTEncoder_Decode(t *testing.T) {
+	gpt2Encoder = *CacheLoadEncoder("gpt2-tokenizer")
+
 	// This test is to check if the GPTEncoder is able to decode the tokens correctly
 	if gpt2Encoded == nil {
 		corpEncoded := gpt2Encoder.Encode(&corpus)
@@ -818,6 +703,8 @@ func TestGPTEncoder_Decode(t *testing.T) {
 // the clipCorpus. The decoded corpus is correct in this test.
 // We stop the test right before the bug.
 func TestCLIPEncoder_Decode(t *testing.T) {
+	clipEncoder = *CacheLoadEncoder("clip-tokenizer")
+
 	if clipEncoded == nil {
 		corpEncoded := clipEncoder.Encode(&corpus)
 		clipEncoded = corpEncoded
@@ -848,6 +735,8 @@ func TestCLIPEncoder_Decode(t *testing.T) {
 }
 
 func TestPileEncoder_Decode(t *testing.T) {
+	pileEncoder = *CacheLoadEncoder("pile-tokenizer")
+
 	// This test is to check if the PileEncoder is able to decode the tokens correctly
 	if pileEncoded == nil {
 		corpEncoded := pileEncoder.Encode(&corpus)
@@ -880,6 +769,8 @@ func TestPileEncoder_Decode(t *testing.T) {
 }
 
 func TestGPTEncoder_TokensReady(t *testing.T) {
+	gpt2Encoder = *CacheLoadEncoder("gpt2-tokenizer")
+
 	// This test is to check if the TokensReady function is able to determine if the tokens are ready for context
 	multiTokenAsterism := "⁂"
 	tokens := gpt2Encoder.Encode(&multiTokenAsterism)
@@ -901,6 +792,8 @@ func TestGPTEncoder_TokensReady(t *testing.T) {
 }
 
 func TestGPTEncoder_TokensReadyContext(t *testing.T) {
+	pileEncoder = *CacheLoadEncoder("pile-tokenizer")
+
 	// This test is to check if the TokensReady function is able to determine if the tokens are ready for context
 	var tokens Tokens
 	badContext, err := os.ReadFile("resources/badcontext.json")
@@ -988,6 +881,8 @@ func TestUnitrimFunctionality(t *testing.T) {
 }
 
 func TestLlamaEncoder_Encode(t *testing.T) {
+	gpt2Encoder = *CacheLoadEncoder("gpt2-tokenizer")
+
 	// This test is to check if the encoder is able to encode a basic string
 	start := time.Now()
 	tokenCt := len(*gpt2Encoder.Encode(&corpus))
@@ -1005,6 +900,8 @@ func TestLlamaEncoder_Encode(t *testing.T) {
 }
 
 func TestLlamaTwoEncoder_Encode(t *testing.T) {
+	llama2Encoder = *CacheLoadEncoder("llama-tokenizer")
+
 	// This test is to check if the encoder is able to encode a basic string
 	testString := "The fox jumped over the hare.\nThe turtle is faster than the hare."
 	llamaTokens := llama2Encoder.Encode(&testString)
@@ -1015,6 +912,8 @@ func TestLlamaTwoEncoder_Encode(t *testing.T) {
 }
 
 func TestLlamaTwoTokenizerDecode(t *testing.T) {
+	llama2Encoder = *CacheLoadEncoder("llama-tokenizer")
+
 	// This test is to check if the decoder is able to decode the tokens correctly
 	outputString := "<s>The fox jumped over the hare.\nThe turtle is faster than the hare."
 	llamaTokens := Tokens{1, 1576, 1701, 29916, 12500, 287, 975, 278, 447, 276, 29889, 13, 1576, 260, 4227, 280, 338, 8473, 1135, 278, 447, 276, 29889}
@@ -1023,6 +922,8 @@ func TestLlamaTwoTokenizerDecode(t *testing.T) {
 }
 
 func TestLlamaTwoEncodeDecode(t *testing.T) {
+	llama2Encoder = *CacheLoadEncoder("llama-tokenizer")
+
 	// This test is to check if the encoder is able to encode and decode a basic string
 	testString := "The fox jumped over the hare.\nThe turtle is faster than the hare."
 	outputString := "The fox jumped over the hare.\nThe turtle is faster than the hare."
@@ -1033,6 +934,8 @@ func TestLlamaTwoEncodeDecode(t *testing.T) {
 
 // This is Mistral tokenizer V1, associated with 7b instruct https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2
 func TestMistralEncoder_Encode(t *testing.T) {
+	mistralEncoder = *CacheLoadEncoder("mistral-tokenizer")
+
 	// This test is to check if the encoder is able to encode a basic string
 	testString := "The fox jumped over the hare.\nThe turtle is faster than the hare."
 	mistralTokens := mistralEncoder.Encode(&testString)
@@ -1043,6 +946,8 @@ func TestMistralEncoder_Encode(t *testing.T) {
 }
 
 func TestMistralTokenizerDecode(t *testing.T) {
+	mistralEncoder = *CacheLoadEncoder("mistral-tokenizer")
+
 	// This test is to check if the decoder is able to decode the tokens correctly
 	outputString := "<s> The fox jumped over the hare.\nThe turtle is faster than the hare."
 	mistralTokens := Tokens{1, 415, 285, 1142, 14949, 754, 272, 295, 492, 28723, 13, 1014, 261, 3525, 291, 349, 9556, 821, 272, 295, 492, 28723}
@@ -1051,6 +956,8 @@ func TestMistralTokenizerDecode(t *testing.T) {
 }
 
 func TestMistralEncodeDecode(t *testing.T) {
+	mistralEncoder = *CacheLoadEncoder("mistral-tokenizer")
+
 	// This test is to check if the encoder is able to encode and decode a basic string
 	testString := "The fox jumped over the hare.\nThe turtle is faster than the hare."
 	outputString := "<s> The fox jumped over the hare.\nThe turtle is faster than the hare."
@@ -1060,6 +967,8 @@ func TestMistralEncodeDecode(t *testing.T) {
 }
 
 func TestMistralEncodeDecodeFrankenstein(t *testing.T) {
+	mistralEncoder = *CacheLoadEncoder("mistral-tokenizer")
+
 	// This test is to check if the encoder is able to encode and decode the Frankenstein corpus
 	frankensteinCorpus := "resources/frankenstein.txt"
 	frankensteinText, err := os.ReadFile(frankensteinCorpus)
@@ -1082,6 +991,8 @@ func TestMistralEncodeDecodeFrankenstein(t *testing.T) {
 }
 
 func TestMistralEncodeDecode_Emojis(t *testing.T) {
+	mistralEncoder = *CacheLoadEncoder("mistral-tokenizer")
+
 	// This test is to check if the encoder is able to encode and decode emojis
 	// Requires the ability to properly handle byte tokens in the encoder
 	testString := "expensive 😦 padding ⁂ padding"
@@ -1092,6 +1003,8 @@ func TestMistralEncodeDecode_Emojis(t *testing.T) {
 }
 
 func TestMistralEncodeDecode_LargeCorpus(t *testing.T) {
+	mistralEncoder = *CacheLoadEncoder("mistral-tokenizer")
+
 	// This test is to check if the encoder is able to encode and decode a large corpus
 	referenceFile := "resources/test_references/753.txt"
 	referenceBin := "resources/test_references/753_mistralv1.bin"
@@ -1136,6 +1049,8 @@ func TestMistralEncodeDecode_LargeCorpus(t *testing.T) {
 }
 
 func TestLlama3Encoder_Encode(t *testing.T) {
+	llama3Encoder = *CacheLoadEncoder("llama3-tokenizer")
+
 	// This test is to check if the encoder is able to encode a basic string
 	testString := "The fox jumped over the hare.\nThe turtle is faster than the hare."
 	llamaTokens := llama3Encoder.Encode(&testString)
@@ -1147,6 +1062,8 @@ func TestLlama3Encoder_Encode(t *testing.T) {
 }
 
 func TestLlama3TokenizerDecode(t *testing.T) {
+	llama3Encoder = *CacheLoadEncoder("llama3-tokenizer")
+
 	// This test is to check if the decoder is able to decode the tokens correctly
 	outputString := "<|begin_of_text|>The fox jumped over the hare.\nThe turtle is faster than the hare.<|end_of_text|>"
 	llamaTokens := Tokens{128000, 791, 39935, 27096, 927, 279, 96018, 627, 791, 37189, 374, 10819, 1109, 279, 96018, 13, 128001}
@@ -1155,6 +1072,8 @@ func TestLlama3TokenizerDecode(t *testing.T) {
 }
 
 func TestLlama3EncodeDecode(t *testing.T) {
+	llama3Encoder = *CacheLoadEncoder("llama3-tokenizer")
+
 	// This test is to check if the encoder is able to encode and decode a basic string
 	testString := "The fox jumped over the hare.\nThe turtle is faster than the hare."
 	outputString := "<|begin_of_text|>The fox jumped over the hare.\nThe turtle is faster than the hare.<|end_of_text|>"
@@ -1164,6 +1083,8 @@ func TestLlama3EncodeDecode(t *testing.T) {
 }
 
 func TestLlama3EncodeDecode_Merges(t *testing.T) {
+	llama3Encoder = *CacheLoadEncoder("llama3-tokenizer")
+
 	// This test is to check if the encoder is able to merge the tokens correctly
 	// If it fails, the merge function in the streaming_encode does not check for invalid merge pairs correctly
 	testString := "Ah! Cornelius Agrippa! My dear Victor, d"
@@ -1174,6 +1095,8 @@ func TestLlama3EncodeDecode_Merges(t *testing.T) {
 	assert.Equal(t, outputString, output)
 }
 func TestLlama3Merge(t *testing.T) {
+	llama3Encoder = *CacheLoadEncoder("llama3-tokenizer")
+
 	// This test is to check if the encoder is able to merge the tokens correctly
 	// If it fails, the merge function in the streaming_encode does not check for invalid merge pairs correctly
 	//testString := "Description\ndescription\n Description\n description"
@@ -1197,6 +1120,8 @@ func TestLlama3Merge(t *testing.T) {
 }
 
 func TestLlama3EncodeDecode_LargeCorpus(t *testing.T) {
+	llama3Encoder = *CacheLoadEncoder("llama3-tokenizer")
+
 	// This test is to check if the encoder is able to encode and decode a large corpus
 	referenceFile := "resources/test_references/753.txt"
 	referenceBin := "resources/test_references/753_llama3.bin"
@@ -1239,6 +1164,8 @@ func TestLlama3EncodeDecode_LargeCorpus(t *testing.T) {
 }
 
 func TestLlama3EncodeDecodeFrankenstein(t *testing.T) {
+	llama3Encoder = *CacheLoadEncoder("llama3-tokenizer")
+
 	// This test is to check if the encoder is able to encode and decode the Frankenstein corpus
 	frankensteinCorpus := "resources/frankenstein.txt"
 	frankensteinText, err := os.ReadFile(frankensteinCorpus)
@@ -1304,6 +1231,8 @@ func TestReadTokenizerConfig(t *testing.T) {
 }
 
 func TestGPT2DefaultPadding(t *testing.T) {
+	gpt2Encoder = *CacheLoadEncoder("gpt2-tokenizer")
+
 	// GPT2 defines a padding token, we test if it properly gets this token
 	// corresponds to <|padding|> in the vocab
 	assert.Equal(t, gpt2Encoder.PadToken, Token(50257))
@@ -1311,6 +1240,8 @@ func TestGPT2DefaultPadding(t *testing.T) {
 }
 
 func TestPilePadding(t *testing.T) {
+	pileEncoder = *CacheLoadEncoder("pile-tokenizer")
+
 	// Pile defines a padding token, we test if it properly gets this token
 	// corresponds to <|padding|> in the vocab
 	assert.Equal(t, pileEncoder.PadToken, Token(1))
@@ -1318,6 +1249,8 @@ func TestPilePadding(t *testing.T) {
 }
 
 func TestClipPadding(t *testing.T) {
+	clipEncoder = *CacheLoadEncoder("clip-tokenizer")
+
 	// CLIP defines a padding token, we test if it properly gets this token
 	// corresponds to <|endoftext|> in the vocab
 	assert.Equal(t, clipEncoder.PadToken, Token(49407))
@@ -1325,6 +1258,8 @@ func TestClipPadding(t *testing.T) {
 }
 
 func TestNerdstashPadding(t *testing.T) {
+	nerdstashV2Encoder = *CacheLoadEncoder("nerdstash_v2-tokenizer")
+
 	// Nerdstash defines a padding token, we test if it properly gets this token
 	// corresponds to <|pad|> in the vocab
 	assert.Equal(t, nerdstashV2Encoder.PadToken, Token(0))
@@ -1332,6 +1267,8 @@ func TestNerdstashPadding(t *testing.T) {
 }
 
 func TestLlamaPadding(t *testing.T) {
+	llama2Encoder = *CacheLoadEncoder("llama-tokenizer")
+
 	// Llama doesn't define a padding token, we test if it properly defaults to
 	// [PAD] as 65535
 	assert.Equal(t, llama2Encoder.PadToken, Token(65535))
@@ -1339,6 +1276,8 @@ func TestLlamaPadding(t *testing.T) {
 }
 
 func TestMistralPadding(t *testing.T) {
+	mistralEncoder = *CacheLoadEncoder("mistral-tokenizer")
+
 	// Mistral doesn't define a padding token, we test if it properly defaults to
 	// [PAD] as 65535
 	assert.Equal(t, mistralEncoder.PadToken, Token(65535))
@@ -1346,6 +1285,8 @@ func TestMistralPadding(t *testing.T) {
 }
 
 func TestLlama3Padding(t *testing.T) {
+	llama3Encoder = *CacheLoadEncoder("llama3-tokenizer")
+
 	// Llama doesn't define a padding token, we test if it properly defaults to
 	// [PAD] as 4294967295 due to the uint32 max value
 	assert.Equal(t, llama3Encoder.PadToken, Token(4294967295))

@@ -1181,9 +1181,6 @@ func (tt TextsTokenizer) TokenizeTextsToContexts(
 							idx-begin,
 						)
 						idx = begin + offset
-						if offset != tt.BoundaryOverlap {
-							println("idx: ", idx, " offset:", offset)
-						}
 					}
 
 					boundaryIdxes = boundaryIdxes[:0]
@@ -1251,6 +1248,7 @@ func GCD(a, b int) int {
 // aligned binary file.
 func WriteContexts(
 	outPath string,
+	indexPath string,
 	contexts chan gpt_bpe.Tokens,
 	encoder *gpt_bpe.GPTEncoder,
 	sampling int,
@@ -1279,6 +1277,18 @@ func WriteContexts(
 	if showContexts && encoder == nil {
 		showContexts = false
 		log.Println("warning: no encoder info, cannot show contexts")
+	}
+
+	// We need to create an index file if we are not using streaming encode as well.
+	var indexFile *os.File
+	var iErr error
+	// Our index handle.
+	if err := os.MkdirAll(filepath.Dir(indexPath), os.ModePerm); err != nil {
+		return 0, err
+	}
+	indexFile, iErr = os.OpenFile(indexPath, os.O_TRUNC|os.O_RDWR|os.O_CREATE, 0755)
+	if iErr != nil {
+		return 0, iErr
 	}
 
 	// create file AND filepath if not exists
@@ -1341,6 +1351,7 @@ func WriteContexts(
 		end          int
 	}
 	idxes := make([]paddingTuple, 0)
+	idxFormat := "{\"offset\": %d, \"tokens\": %d}\n"
 	for context := range sampledContexts {
 		binContext, err := context.ToBin(useUint32)
 		if err != nil {
@@ -1418,6 +1429,14 @@ func WriteContexts(
 			if _, err := outFile.Write(*binContext); err != nil {
 				return totalTokens, err
 			}
+		}
+
+		_, err = indexFile.WriteString(
+			fmt.Sprintf(idxFormat, totalTokens, len(context)),
+		)
+
+		if err != nil {
+			return totalTokens, err
 		}
 
 		totalTokens += len(context)
@@ -1870,6 +1889,7 @@ func main() {
 				}
 				total, writeErr := WriteContexts(
 					outputFilePath,
+					indexFilePath,
 					contexts,
 					encoder,
 					sampling,
@@ -1892,43 +1912,50 @@ func main() {
 	} else {
 		wg := sync.WaitGroup{}
 		tokenizerStatuses := make([]*TokenizerStatus, *numThreads)
-		contexts := make(chan gpt_bpe.Tokens, 16)
-		for i := 0; i < *numThreads; i++ {
+		for threadIdx := 0; threadIdx < *numThreads; threadIdx++ {
 			var status *TokenizerStatus
 			var tokErr error
 			wg.Add(1)
-			contexts, status, tokErr = textsTokenizer.TokenizeTextsToContexts(
-				textReaders, encoder, contexts, &wg,
-			)
-			if tokErr != nil {
-				log.Fatal(tokErr)
-			}
-			tokenizerStatuses[i] = status
+			go func(threadId int) {
+				contexts := make(chan gpt_bpe.Tokens, 32)
+				outputFilePath := fmt.Sprintf(
+					"%s.%d.tokens",
+					*outputFile, threadId,
+				)
+				indexFilePath := strings.ReplaceAll(outputFilePath, ".tokens", ".index")
+				contexts, status, tokErr = textsTokenizer.TokenizeTextsToContexts(
+					textReaders, encoder, contexts, &wg,
+				)
+				if tokErr != nil {
+					log.Fatal(tokErr)
+				}
+				tokenizerStatuses[threadId] = status
+				if tokErr != nil {
+					log.Fatal(tokErr)
+				}
+
+				total, writeErr := WriteContexts(
+					outputFilePath,
+					indexFilePath,
+					contexts,
+					encoder,
+					sampling,
+					*reorderPaths == "shuffle",
+					*enforceUint32,
+					*showContexts,
+				)
+				if writeErr != nil {
+					log.Fatal(writeErr)
+				}
+				contextTokens += total
+				wg.Done()
+			}(threadIdx)
 		}
 
 		done, statusWg := StatusWatcher(tokenizerStatuses)
-		var writeErr error
-		contextWg := sync.WaitGroup{}
-		contextWg.Add(1)
-		go func() {
-			contextTokens, writeErr = WriteContexts(
-				*outputFile,
-				contexts,
-				encoder,
-				sampling,
-				*reorderPaths == "shuffle",
-				*enforceUint32,
-				*showContexts,
-			)
-			contextWg.Done()
-		}()
 
-		if writeErr != nil {
-			log.Fatal(writeErr)
-		}
+		// Wait for all threads to finish
 		wg.Wait()
-		close(contexts)
-		contextWg.Wait()
 		close(done)
 		statusWg.Wait()
 	}
